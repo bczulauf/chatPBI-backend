@@ -4,6 +4,7 @@ import cors from 'cors';
 import OpenAI from 'openai';
 import fs from 'fs';
 import Papa from 'papaparse';
+import EventEmitter from 'events';
 import { exec } from 'child_process';
 
 const app = express();
@@ -11,6 +12,9 @@ const port = process.env.PORT || 3001;
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cors());
+
+// Create an event emitter to manage connections and messages
+const eventEmitter = new EventEmitter();
 
 const storage = multer.diskStorage({
   destination: (req, _file, cb) => {
@@ -45,8 +49,28 @@ app.post('/api/setApiKey', (req, res) => {
 
 const clients: { [key: string]: any } = {};
 
+type TextMessage = {
+  type: 'text';
+  content: string;
+}
+
+type CodeMessage = {
+  type: 'code';
+  language: string;
+  code: string;
+}
+
+type ImageMessage = {
+  type: 'image';
+  imageUrl: string;
+  altText?: string;
+}
+
+type Message = TextMessage | CodeMessage | ImageMessage;
+
 app.get('/events', (req, res) => {
   const userToken = req.query.userToken as string;
+  console.log(userToken, 'event user token');
 
   if (!userToken) {
     return res.status(400).send('Token required');
@@ -60,6 +84,27 @@ app.get('/events', (req, res) => {
 
   // Store this client's response object
   clients[userToken] = res;
+
+  // Event listener to send messages to the client
+  const eventListener = (message: Message) => {
+    const clientRes = clients[userToken]; // Rename this variable to avoid shadowing
+    if (!clientRes) {
+      console.error('Client response for userToken not found');
+      return;
+    }
+    
+    const jsonString = JSON.stringify(message);
+
+    // Split by newline and format for SSE
+    const formattedData = jsonString.split('\n').map(line => `data: ${line}`).join('\n');
+    console.log(formattedData);
+
+    // Send the formatted data, followed by two newline characters to signify the end of the event
+    clientRes.write(`${formattedData}\n\n`);
+  };
+
+  // Register the event listener
+  eventEmitter.on('message', eventListener);
 
   // Remove this client when they disconnect
   req.on('close', () => {
@@ -78,6 +123,17 @@ app.post('/upload', upload.single('file'), (req, res) => {
 
 // Define the function to be used by OpenAI
 const functions = [
+  {
+    name: "plan",
+    description: "Come up with a step by step plan to answer user data question",
+    parameters: {
+      type: "object",
+      properties: {
+        user_question: { type: "string", description: "User question about the data in the CSV file"},
+      },
+      required: ["user_question"],
+    },
+  },
     {
       name: "write_code",
       description: "Write Python code to analyze CSV data.",
@@ -85,8 +141,9 @@ const functions = [
         type: "object",
         properties: {
           user_question: { type: "string", description: "User question about the data in the CSV file"},
+          plan: { type: "string", description: "Plan for how we can answer user question."},
         },
-        required: ["user_question"],
+        required: ["user_question", "plan"],
       },
     },
     {
@@ -102,7 +159,7 @@ const functions = [
     },
     {
       name: "interpret_results",
-      description: "Interprets results of code execution.",
+      description: "Interpret results of code execution.",
       parameters: {
         type: "object",
         properties: {
@@ -142,14 +199,40 @@ const executeCode = (pythonCode: string): Promise<string> => {
     });
   });
 }
+
+const plan = async(openai: OpenAI, filePath: string, columns: string[], question: string) => {
+  const codePromptMessages: OpenAI.ChatCompletionMessageParam[] = [
+    {
+      "role": "system",
+      "content": `You are a data analyst. I want you to come up with a step by step plan for how you will answer a user data question. In order to answer the question, you can write and execute Python code that analyzes the CSV file located at '${filePath}'. This CSV contains the following columns: ${columns.join(', ')}.`
+    },
+    {
+      "role": "user",
+      "content": `User data question: ${question}.`
+    }
+  ];
+
+  const planResponse = await openai.chat.completions.create({
+    model: "gpt-3.5-turbo",
+    messages: codePromptMessages
+  });
+
+  const plan = planResponse.choices[0].message.content;
+
+  if (plan) {
+    return plan;
+  } else {
+    throw new Error('Failed to generate plan from prompt');
+  }
+}
   
-const writeCode = async (openai: OpenAI, filepath: string, columns: string[], question: string): Promise<string> => {
+const writeCode = async (openai: OpenAI, filePath: string, columns: string[], question: string, plan: string): Promise<string> => {
   // First, let's ask OpenAI to generate Python code based on the data path and columns.
   const codePromptMessages: OpenAI.ChatCompletionMessageParam[] = [
     {
       "role": "system",
       "content": 
-`You are a Python code generator. I want you to write code that analyzes the CSV file located at '${filepath}'. This CSV contains the following columns: ${columns.join(', ')}. Inside the function:
+`You are a Python code generator. I want you to write code that analyzes the CSV file located at '${filePath}' based on the plan: ${plan}. This CSV contains the following columns: ${columns.join(', ')}. Inside the function:
 - Always use the 'print()' function to display your results.
 - If any visualizations (like plots or charts) are created, save them as a PNG in the 'tmp' folder.
 - After saving the visualization, 'print()' the file path where the visualization was saved.
@@ -163,7 +246,7 @@ Now, please generate the function for me.`
   ];
 
   const codeGenerationResponse = await openai.chat.completions.create({
-    model: "gpt-3.5-turbo",
+    model: "gpt-4",
     messages: codePromptMessages
   });
 
@@ -201,7 +284,7 @@ app.post('/message', async (req, res) => {
     const columnNames = results.data[0] as string[]; 
   
     let messages: OpenAI.ChatCompletionMessageParam[] = [
-      { role: "system", content: `You are the user's personal and friendly data analyst. Your role is to understand their data-related questions, craft Python code to extract the insights they're seeking, execute that code, and then explain the results in an easy-to-understand manner.`},
+      { role: "system", content: `You are the user's personal data analyst. Your role is to understand their data-related questions, craft Python code to extract the insights they're seeking, execute that code, and then explain the results in an easy-to-understand manner.`},
       { role: "user", content: userMessage }
     ];
     
@@ -233,14 +316,19 @@ app.post('/message', async (req, res) => {
         const functionArgs = JSON.parse(responseMessage.function_call.arguments);
         let functionResponse = '';
 
-        if (functionName === 'write_code') {
-          functionResponse = await writeCode(openai, filePath, columnNames, functionArgs.user_question);
+        if (functionName === 'plan') {
+          functionResponse = await plan(openai, filePath, columnNames, functionArgs.user_question);
+          eventEmitter.emit('message', {type: 'text', content: functionResponse});
+        }
+        else if (functionName === 'write_code') {
+          functionResponse = await writeCode(openai, filePath, columnNames, functionArgs.user_question, functionArgs.plan);
+          eventEmitter.emit('message', {type: 'code', code: functionResponse, language: 'python'});
         }
         else if (functionName === 'execute_code') {
           try {
             functionResponse = await executeCode(functionArgs.code);
           } catch (err) {
-              console.error(`Error executing code: ${err}`);
+            console.error(`Error executing code: ${err}`);
           }
         }
         else if (functionName === "interpret_results") {
@@ -263,9 +351,9 @@ app.post('/message', async (req, res) => {
     }
   
     // Emit the final response to the client using SSE
-    for (const client of Object.values(clients)) {
-      client.write(`data: ${JSON.stringify(responseMessage)}\n\n`);
-    }
+    // for (const client of Object.values(clients)) {
+    //   client.write(`data: ${JSON.stringify(responseMessage)}\n\n`);
+    // }
     
     res.json(responseMessage);
 });
