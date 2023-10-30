@@ -3,8 +3,8 @@ import multer from 'multer';
 import cors from 'cors';
 import OpenAI from 'openai';
 import fs from 'fs';
-import Papa from 'papaparse';
 import EventEmitter from 'events';
+import streamPythonCode from './streamCode';
 import { exec } from 'child_process';
 
 const app = express();
@@ -33,7 +33,6 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 const userApiKeys: { [userToken: string]: string } = {};
-const userFilePaths: { [userToken: string]: string } = {};
 
 // POST endpoint to save user's OpenAI API key
 app.post('/api/setApiKey', (req, res) => {
@@ -112,17 +111,33 @@ app.get('/events', (req, res) => {
   });
 });
 
-app.post('/upload', upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).send('No file uploaded.');
-  }
-  const filePath = req.file.path;
-  userFilePaths[req.body.userToken] = filePath;
-  res.send({ path: filePath });
-});
-
 // Define the function to be used by OpenAI
 const functions = [
+  {
+    name: "extract_dataset_info",
+    description: "This function is designed to be triggered automatically whenever a user uploads a dataset. Its primary role is to provide a quick overview of the data to help both the user and the system gain insights into the dataset's structure and content.",
+    parameters: {
+      type: "object",
+      properties: {
+        file_path: { 
+          type: "string",
+          description: "The path to the uploaded CSV file." 
+        },
+        required: ["file_path"]
+      }
+    }
+  },
+  {
+    name: "ask_clarification_question",
+    description: "If any part of the dataset or the task is unclear, ambiguous, or incomplete, please ask for clarification.",
+    parameters: {
+      type: "object",
+      properties: {
+        user_question: { type: "string", description: "User question about the data in the CSV file."},
+      },
+      required: ["user_question"],
+    },
+  },
   {
     name: "plan",
     description: "Come up with a step by step plan to answer user data question",
@@ -130,8 +145,16 @@ const functions = [
       type: "object",
       properties: {
         user_question: { type: "string", description: "User question about the data in the CSV file"},
+        file_path: { 
+          type: "string",
+          description: "The path to the uploaded CSV file." 
+        },
+        dataset_sample: { 
+          type: "string",
+          description: "A representative row extracted from the dataset, obtained by executing the df.head(1) command in Python’s pandas library."
+        },
       },
-      required: ["user_question"],
+      required: ["user_question", "file_path", "dataset_sample"],
     },
   },
     {
@@ -142,8 +165,12 @@ const functions = [
         properties: {
           user_question: { type: "string", description: "User question about the data in the CSV file"},
           plan: { type: "string", description: "Plan for how we can answer user question."},
+          file_path: { 
+            type: "string",
+            description: "The path to the uploaded CSV file." 
+          },
         },
-        required: ["user_question", "plan"],
+        required: ["user_question", "plan", "file_path", "dataset_sample"],
       },
     },
     {
@@ -200,11 +227,28 @@ const executeCode = (pythonCode: string): Promise<string> => {
   });
 }
 
-const plan = async(openai: OpenAI, filePath: string, columns: string[], question: string) => {
+const extractDatasetInfo = async(filePath: string) => {
+  const result = await executeCode(
+`
+import pandas as pd
+
+# Path to the CSV file
+file_path = '/path/to/your/file.csv'
+
+# Read the CSV file
+df = pd.read_csv(file_path)
+
+# Print the first row
+print(df.head(1))`);
+
+return result;
+}
+
+const plan = async(openai: OpenAI, filePath: string, datasetSample: string, question: string) => {
   const codePromptMessages: OpenAI.ChatCompletionMessageParam[] = [
     {
       "role": "system",
-      "content": `You are a data analyst. I want you to come up with a step by step plan for how you will answer a user data question. In order to answer the question, you can write and execute Python code that analyzes the CSV file located at '${filePath}'. This CSV contains the following columns: ${columns.join(', ')}.`
+      "content": `You are a data analyst. I want you to come up with a step by step plan for how you will answer a user data question. In order to answer the question, you can write and execute Python code that analyzes the CSV file located at '${filePath}'. Here is a sample row of data: ${datasetSample}.`
     },
     {
       "role": "user",
@@ -226,13 +270,13 @@ const plan = async(openai: OpenAI, filePath: string, columns: string[], question
   }
 }
   
-const writeCode = async (openai: OpenAI, filePath: string, columns: string[], question: string, plan: string): Promise<string> => {
+const writeCode = async (openai: OpenAI, filePath: string, datasetSample: string, question: string, plan: string): Promise<string> => {
   // First, let's ask OpenAI to generate Python code based on the data path and columns.
   const codePromptMessages: OpenAI.ChatCompletionMessageParam[] = [
     {
       "role": "system",
       "content": 
-`You are a Python code generator. I want you to write code that analyzes the CSV file located at '${filePath}' based on the plan: ${plan}. This CSV contains the following columns: ${columns.join(', ')}. Inside the function:
+`You are a Python code generator. I want you to write code that analyzes the CSV file located at '${filePath}' based on the plan: ${plan}. Here is a sample row of data: ${datasetSample}. Inside the function:
 - Always use the 'print()' function to display your results.
 - If any visualizations (like plots or charts) are created, save them as a PNG in the 'tmp' folder.
 - After saving the visualization, 'print()' the file path where the visualization was saved.
@@ -265,97 +309,109 @@ const interpretResults = (results: {data?: string, filePath?: string}[]) => {
   }
 }
 
-// Endpoint to receive messages from the user
-app.post('/message', async (req, res) => {
-    const userMessage = req.body.message;
-    const userToken = req.body.userToken;
-    const openaiApiKey = userApiKeys[userToken];
+const processMessage = async(userMessage: string, userToken: string) => {
+  const openaiApiKey = userApiKeys[userToken];
     
-    if (!openaiApiKey) {
-      return res.status(400).send('Invalid user token or OpenAI API key not set');
-    }
-    
-    const openai = new OpenAI({apiKey: openaiApiKey});
+  if (!openaiApiKey) {
+    throw new Error('Invalid user token or OpenAI API key not set');
+  }
+  
+  const openai = new OpenAI({apiKey: openaiApiKey});
 
-    // Parse the CSV to retrieve the column names
-    const filePath = userFilePaths[userToken];
-    const fileContent = fs.readFileSync(filePath, 'utf8');
-    const results = Papa.parse(fileContent, { preview: 1, header: false });
-    const columnNames = results.data[0] as string[]; 
+  let messages: OpenAI.ChatCompletionMessageParam[] = [
+    { role: "system", content: `You are the user's personal data analyst. Your role is to understand their data-related questions, craft Python code to extract the insights they're seeking, execute that code, and then explain the results in an easy-to-understand manner.`},
+    { role: "user", content: userMessage }
+  ];
   
-    let messages: OpenAI.ChatCompletionMessageParam[] = [
-      { role: "system", content: `You are the user's personal data analyst. Your role is to understand their data-related questions, craft Python code to extract the insights they're seeking, execute that code, and then explain the results in an easy-to-understand manner.`},
-      { role: "user", content: userMessage }
-    ];
-    
-    let responseMessage: any;
-    let continueConversation = true;
-    const MAX_ITERATIONS = 5; // Define a limit to avoid infinite loops
-    let iterationCount = 0;
-  
-    while (continueConversation && iterationCount < MAX_ITERATIONS) {
-      const response = await openai.chat.completions.create({
-        model: "gpt-3.5-turbo",
-        messages: messages,
-        functions: functions,
-        function_call: "auto"
+  let responseMessage: any;
+  let continueConversation = true;
+  const MAX_ITERATIONS = 5; // Define a limit to avoid infinite loops
+  let iterationCount = 0;
+
+  while (continueConversation && iterationCount < MAX_ITERATIONS) {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: messages,
+      functions: functions,
+      function_call: "auto"
+    });
+
+    responseMessage = response.choices[0].message;
+    messages.push(responseMessage);
+    console.log(responseMessage, 'response message');
+
+    // Emit the response to the appropriate client using SSE
+    const client = clients[userToken];
+    if (client) {
+      client.write(`data: ${JSON.stringify(responseMessage)}\n\n`);
+    }
+
+    if (responseMessage.function_call) {
+      const functionName = responseMessage.function_call.name;
+      const functionArgs = JSON.parse(responseMessage.function_call.arguments);
+      let functionResponse = '';
+
+      if (functionName === 'extract_dataset_info') {
+        functionResponse = await extractDatasetInfo(functionArgs.file_path);
+        eventEmitter.emit('message', {type: 'text', content: functionResponse});
+      }
+      else if (functionName === 'plan') {
+        functionResponse = await plan(openai, functionArgs.file_path, functionArgs.dataset_sample, functionArgs.user_question);
+        eventEmitter.emit('message', {type: 'text', content: functionResponse});
+      }
+      else if (functionName === 'write_code') {
+        functionResponse = await writeCode(openai, functionArgs.file_path, functionArgs.dataset_sample, functionArgs.user_question, functionArgs.plan);
+        eventEmitter.emit('message', {type: 'code', code: functionResponse, language: 'python'});
+      }
+      else if (functionName === 'execute_code') {
+        try {
+          // const pythonInterpreter = './myenv/bin/python';
+          functionResponse = await executeCode(functionArgs.code);
+        } catch (err) {
+          console.error(`Error executing code: ${err}`);
+        }
+      }
+      else if (functionName === "interpret_results") {
+        interpretResults(functionArgs.results);
+      }
+
+      messages.push({
+        role: "function",
+        name: functionName,
+        content: functionResponse
       });
-  
-      responseMessage = response.choices[0].message;
-      messages.push(responseMessage);
-      console.log(responseMessage, 'response message');
 
-      // Emit the response to the appropriate client using SSE
-      const client = clients[userToken];
-      if (client) {
-        client.write(`data: ${JSON.stringify(responseMessage)}\n\n`);
-      }
-  
-      if (responseMessage.function_call) {
-        const functionName = responseMessage.function_call.name;
-        const functionArgs = JSON.parse(responseMessage.function_call.arguments);
-        let functionResponse = '';
-
-        if (functionName === 'plan') {
-          functionResponse = await plan(openai, filePath, columnNames, functionArgs.user_question);
-          eventEmitter.emit('message', {type: 'text', content: functionResponse});
-        }
-        else if (functionName === 'write_code') {
-          functionResponse = await writeCode(openai, filePath, columnNames, functionArgs.user_question, functionArgs.plan);
-          eventEmitter.emit('message', {type: 'code', code: functionResponse, language: 'python'});
-        }
-        else if (functionName === 'execute_code') {
-          try {
-            functionResponse = await executeCode(functionArgs.code);
-          } catch (err) {
-            console.error(`Error executing code: ${err}`);
-          }
-        }
-        else if (functionName === "interpret_results") {
-          interpretResults(functionArgs.results);
-        }
-  
-        messages.push({
-          role: "function",
-          name: functionName,
-          content: functionResponse
-        });
-  
-      } else {
-        // If OpenAI did not make a function call and provided an answer, we'll assume the question is answered.
-        // However, you may want to have a more sophisticated logic here, such as checking the content of the response.
-        continueConversation = false;
-      }
-  
-      iterationCount++;
+    } else {
+      // If OpenAI did not make a function call and provided an answer, we'll assume the question is answered.
+      // However, you may want to have a more sophisticated logic here, such as checking the content of the response.
+      continueConversation = false;
     }
-  
-    // Emit the final response to the client using SSE
-    // for (const client of Object.values(clients)) {
-    //   client.write(`data: ${JSON.stringify(responseMessage)}\n\n`);
-    // }
-    
-    res.json(responseMessage);
+
+    iterationCount++;
+  }
+
+  return responseMessage;
+}
+
+// Endpoint to receive messages from the user
+app.post('/message', upload.single('file'), async(req, res) => {
+  const userMessage = req.body.message;
+  const userToken = req.body.userToken;
+  const file = req.file;
+
+  if (file) {
+    const filePath = file.path;
+    await processMessage(`I uploaded CSV data to: ${filePath}`, userToken);
+  }
+
+  if (userMessage) {
+    try {
+      await processMessage(userMessage, userToken);
+      res.status(200).end();
+    } catch(err) {
+      return res.status(400).send(err);
+    }
+  }
 });
 
 app.listen(port, () => {
